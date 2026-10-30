@@ -24,6 +24,14 @@ static EKEventStore* get_store(void) {
     return store;
 }
 
+// EventKit can resolve partial or stale IDs to another event.
+static EKEvent* find_event_by_id(EKEventStore* store, NSString* eid) {
+    if (eid.length == 0) return nil;
+    EKEvent* event = [store eventWithIdentifier:eid];
+    if (![event.eventIdentifier isEqualToString:eid]) return nil;
+    return event;
+}
+
 // --- Serial dispatch queue for write serialization ---
 
 static dispatch_queue_t get_write_queue(void) {
@@ -640,30 +648,11 @@ ek_result_t ek_cal_get_event(const char* event_id) {
         EKEventStore* store = get_store();
         NSString* eid = [NSString stringWithUTF8String:event_id];
 
-        // Try eventWithIdentifier first (exact match).
-        EKEvent* event = [store eventWithIdentifier:eid];
+        EKEvent* event = find_event_by_id(store, eid);
         if (event) {
             res.result = to_json(event_to_dict(event));
             if (!res.result) res.error = strdup("JSON serialization failed");
             return res;
-        }
-
-        // Prefix match: search events in a broad range and match by prefix.
-        NSString* upperTarget = [eid uppercaseString];
-        NSDate* start = [NSDate dateWithTimeIntervalSinceNow:-365 * 24 * 60 * 60]; // 1 year ago
-        NSDate* end = [NSDate dateWithTimeIntervalSinceNow:365 * 24 * 60 * 60];    // 1 year from now
-        NSPredicate* predicate = [store predicateForEventsWithStartDate:start
-                                                               endDate:end
-                                                             calendars:nil];
-        NSArray<EKEvent*>* events = [store eventsMatchingPredicate:predicate];
-
-        for (EKEvent* e in events) {
-            NSString* eId = [e.eventIdentifier uppercaseString];
-            if ([eId hasPrefix:upperTarget]) {
-                res.result = to_json(event_to_dict(e));
-                if (!res.result) res.error = strdup("JSON serialization failed");
-                return res;
-            }
         }
 
         res.error = strdup([[NSString stringWithFormat:@"event not found: %s", event_id] UTF8String]);
@@ -877,7 +866,65 @@ ek_result_t ek_cal_create_event(const char* json_input) {
     return res;
 }
 
-ek_result_t ek_cal_update_event(const char* event_id, const char* json_input, int span) {
+// series_id strips the "/RID=<unix time>" suffix EventKit gives a detached
+// occurrence's identifier, leaving the ID every occurrence of the series shares.
+static NSString* series_id(NSString* eid) {
+    NSRange r = [eid rangeOfString:@"/RID="];
+    return r.location == NSNotFound ? eid : [eid substringToIndex:r.location];
+}
+
+// find_occurrence returns the instance of a recurring event whose original
+// start (occurrenceDate) matches occ. eventWithIdentifier: always resolves to
+// the series' first occurrence, so writes aimed at a later occurrence must
+// look the instance up from a date-range fetch instead. Detached occurrences
+// keep their original occurrenceDate but are fetched at their current start,
+// so the search widens from a week to a year either side before giving up.
+// eid may be the series ID or any detached occurrence's ID.
+static EKEvent* find_occurrence_within(EKEventStore* store, EKCalendar* cal, NSString* series,
+                                       NSDate* occ, NSTimeInterval radius) {
+    NSPredicate* predicate = [store predicateForEventsWithStartDate:[occ dateByAddingTimeInterval:-radius]
+                                                           endDate:[occ dateByAddingTimeInterval:radius]
+                                                         calendars:@[cal]];
+    for (EKEvent* e in [store eventsMatchingPredicate:predicate]) {
+        if (![series_id(e.eventIdentifier) isEqualToString:series]) continue;
+        NSDate* od = e.occurrenceDate ?: e.startDate;
+        if (fabs([od timeIntervalSinceDate:occ]) < 1.0) return e;
+    }
+    return nil;
+}
+
+static EKEvent* find_occurrence(EKEventStore* store, NSString* eid, NSDate* occ) {
+    if (!occ) return nil;
+    EKEvent* master = find_event_by_id(store, eid);
+    if (!master) return nil;
+    NSString* series = series_id(eid);
+    NSTimeInterval day = 24 * 60 * 60;
+    return find_occurrence_within(store, master.calendar, series, occ, 7 * day)
+        ?: find_occurrence_within(store, master.calendar, series, occ, 366 * day);
+}
+
+// lookup_event resolves an event by identifier, or a single occurrence of it
+// when occurrence_date is non-NULL. Sets *err on failure.
+static EKEvent* lookup_event(EKEventStore* store, const char* event_id, const char* occurrence_date, char** err) {
+    NSString* eid = [NSString stringWithUTF8String:event_id];
+    if (!occurrence_date) {
+        EKEvent* event = find_event_by_id(store, eid);
+        if (!event) *err = strdup([[NSString stringWithFormat:@"event not found: %s", event_id] UTF8String]);
+        return event;
+    }
+    NSDate* occ = parse_iso_date(occurrence_date);
+    if (!occ) {
+        *err = strdup([[NSString stringWithFormat:@"invalid occurrence date: %s", occurrence_date] UTF8String]);
+        return nil;
+    }
+    EKEvent* event = find_occurrence(store, eid, occ);
+    if (!event) {
+        *err = strdup([[NSString stringWithFormat:@"occurrence not found: %s at %s", event_id, occurrence_date] UTF8String]);
+    }
+    return event;
+}
+
+ek_result_t ek_cal_update_event(const char* event_id, const char* occurrence_date, const char* json_input, int span) {
     __block ek_result_t res = {NULL, NULL};
     dispatch_sync(get_write_queue(), ^{
         @autoreleasepool {
@@ -887,13 +934,8 @@ ek_result_t ek_cal_update_event(const char* event_id, const char* json_input, in
             }
 
             EKEventStore* store = get_store();
-            NSString* eid = [NSString stringWithUTF8String:event_id];
-
-            EKEvent* event = [store eventWithIdentifier:eid];
-            if (!event) {
-                res.error = strdup([[NSString stringWithFormat:@"event not found: %s", event_id] UTF8String]);
-                return;
-            }
+            EKEvent* event = lookup_event(store, event_id, occurrence_date, &res.error);
+            if (!event) return;
 
             // Parse JSON input.
             NSData* data = [NSData dataWithBytes:json_input length:strlen(json_input)];
@@ -1340,7 +1382,7 @@ ek_result_t ek_cal_delete_events(const char* json_ids, int span) {
             NSMutableDictionary* errors = [NSMutableDictionary dictionary];
 
             for (NSString* eid in ids) {
-                EKEvent* event = [store eventWithIdentifier:eid];
+                EKEvent* event = find_event_by_id(store, eid);
                 if (!event) continue; // silently skip not found
 
                 NSError* removeError = nil;
@@ -1357,7 +1399,7 @@ ek_result_t ek_cal_delete_events(const char* json_ids, int span) {
     return res;
 }
 
-ek_result_t ek_cal_delete_event(const char* event_id, int span) {
+ek_result_t ek_cal_delete_event(const char* event_id, const char* occurrence_date, int span) {
     __block ek_result_t res = {NULL, NULL};
     dispatch_sync(get_write_queue(), ^{
         @autoreleasepool {
@@ -1367,13 +1409,8 @@ ek_result_t ek_cal_delete_event(const char* event_id, int span) {
             }
 
             EKEventStore* store = get_store();
-            NSString* eid = [NSString stringWithUTF8String:event_id];
-
-            EKEvent* event = [store eventWithIdentifier:eid];
-            if (!event) {
-                res.error = strdup([[NSString stringWithFormat:@"event not found: %s", event_id] UTF8String]);
-                return;
-            }
+            EKEvent* event = lookup_event(store, event_id, occurrence_date, &res.error);
+            if (!event) return;
 
             EKSpan ekSpan = (span == 1) ? EKSpanFutureEvents : EKSpanThisEvent;
             NSError* removeError = nil;
@@ -1382,6 +1419,17 @@ ek_result_t ek_cal_delete_event(const char* event_id, int span) {
                 res.error = strdup([[NSString stringWithFormat:@"failed to delete event: %@",
                     removeError.localizedDescription] UTF8String]);
                 return;
+            }
+
+            // EventKit can report success without removing anything (seen on
+            // detached occurrences), so confirm the occurrence is really gone.
+            if (occurrence_date) {
+                NSString* eid = [NSString stringWithUTF8String:event_id];
+                if (find_occurrence(store, eid, parse_iso_date(occurrence_date))) {
+                    res.error = strdup([[NSString stringWithFormat:@"delete reported success but occurrence %s at %s is still present",
+                        event_id, occurrence_date] UTF8String]);
+                    return;
+                }
             }
 
             res.result = strdup("ok");
@@ -1409,7 +1457,7 @@ ek_result_t ek_cal_respond_to_event(const char* event_id, int status) {
                 return;
             }
             EKEventStore* store = get_store();
-            EKEvent* event = [store eventWithIdentifier:[NSString stringWithUTF8String:event_id]];
+            EKEvent* event = find_event_by_id(store, [NSString stringWithUTF8String:event_id]);
             if (!event) {
                 res.error = strdup([[NSString stringWithFormat:@"event not found: %s", event_id] UTF8String]);
                 return;

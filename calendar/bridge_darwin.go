@@ -111,9 +111,12 @@ func (c *Client) Events(start, end time.Time, opts ...ListOption) ([]Event, erro
 	return parseEventsJSON(jsonStr)
 }
 
-// Event returns a single event by its stable event identifier
-// (EKEvent.eventIdentifier). Returns [ErrNotFound] if no event matches.
+// Event returns a single event by its full, exact stable event identifier
+// (EKEvent.eventIdentifier). Partial, stale, and unknown IDs return [ErrNotFound].
 func (c *Client) Event(id string) (*Event, error) {
+	if strings.IndexByte(id, 0) >= 0 {
+		return nil, ErrNotFound
+	}
 	cID := C.CString(id)
 	defer C.free(unsafe.Pointer(cID))
 
@@ -161,8 +164,37 @@ func (c *Client) CreateEvent(input CreateEventInput) (*Event, error) {
 // UpdateEvent updates an existing event and returns the updated version.
 // Only non-nil fields in the input are modified. The span parameter controls
 // whether the change applies to just this occurrence or all future occurrences
-// of a recurring event. Returns [ErrNotFound] if the event does not exist.
+// of a recurring event. The ID must be full and exact; otherwise it returns
+// [ErrNotFound].
+//
+// For a recurring event, id alone resolves to the series' first occurrence.
+// Use [Client.UpdateEventOccurrence] to target a specific occurrence.
 func (c *Client) UpdateEvent(id string, input UpdateEventInput, span Span) (*Event, error) {
+	return c.updateEvent(id, nil, input, span)
+}
+
+// UpdateEventOccurrence updates the occurrence of a recurring event whose
+// original start is occurrenceDate (the event's [Event.OccurrenceDate]).
+// With [SpanFutureEvents] the change applies from that occurrence onward.
+// The ID must be full and exact. Returns [ErrNotFound] if no such
+// occurrence exists.
+func (c *Client) UpdateEventOccurrence(id string, occurrenceDate time.Time, input UpdateEventInput, span Span) (*Event, error) {
+	return c.updateEvent(id, &occurrenceDate, input, span)
+}
+
+// occurrenceCString converts an optional occurrence date to a C string for
+// the bridge, or nil. The caller frees a non-nil result.
+func occurrenceCString(occ *time.Time) *C.char {
+	if occ == nil {
+		return nil
+	}
+	return C.CString(formatOccurrenceDate(*occ))
+}
+
+func (c *Client) updateEvent(id string, occ *time.Time, input UpdateEventInput, span Span) (*Event, error) {
+	if strings.IndexByte(id, 0) >= 0 {
+		return nil, ErrNotFound
+	}
 	if input.RecurrenceRules != nil {
 		for _, rule := range *input.RecurrenceRules {
 			if err := rule.Validate(); err != nil {
@@ -181,7 +213,12 @@ func (c *Client) UpdateEvent(id string, input UpdateEventInput, span Span) (*Eve
 	cJSON := C.CString(string(jsonBytes))
 	defer C.free(unsafe.Pointer(cJSON))
 
-	res := C.ek_cal_update_event(cID, cJSON, C.int(span))
+	cOcc := occurrenceCString(occ)
+	if cOcc != nil {
+		defer C.free(unsafe.Pointer(cOcc))
+	}
+
+	res := C.ek_cal_update_event(cID, cOcc, cJSON, C.int(span))
 	if res.error != nil {
 		err := resultErr(res)
 		if strings.Contains(err.Error(), "not found") {
@@ -198,12 +235,36 @@ func (c *Client) UpdateEvent(id string, input UpdateEventInput, span Span) (*Eve
 // DeleteEvent permanently removes an event.
 // The span parameter controls whether the deletion applies to just this
 // occurrence or all future occurrences of a recurring event.
-// Returns [ErrNotFound] if the event does not exist.
+// The ID must be full and exact; otherwise it returns [ErrNotFound].
+//
+// For a recurring event, id alone resolves to the series' first occurrence.
+// Use [Client.DeleteEventOccurrence] to target a specific occurrence.
 func (c *Client) DeleteEvent(id string, span Span) error {
+	return c.deleteEvent(id, nil, span)
+}
+
+// DeleteEventOccurrence removes the occurrence of a recurring event whose
+// original start is occurrenceDate (the event's [Event.OccurrenceDate]).
+// With [SpanFutureEvents] that occurrence and all later ones are removed.
+// The ID must be full and exact. Returns [ErrNotFound] if no such
+// occurrence exists, and an error if EventKit reports success but the
+// occurrence is still present.
+func (c *Client) DeleteEventOccurrence(id string, occurrenceDate time.Time, span Span) error {
+	return c.deleteEvent(id, &occurrenceDate, span)
+}
+
+func (c *Client) deleteEvent(id string, occ *time.Time, span Span) error {
+	if strings.IndexByte(id, 0) >= 0 {
+		return ErrNotFound
+	}
 	cID := C.CString(id)
 	defer C.free(unsafe.Pointer(cID))
+	cOcc := occurrenceCString(occ)
+	if cOcc != nil {
+		defer C.free(unsafe.Pointer(cOcc))
+	}
 
-	res := C.ek_cal_delete_event(cID, C.int(span))
+	res := C.ek_cal_delete_event(cID, cOcc, C.int(span))
 	if res.error != nil {
 		err := resultErr(res)
 		if strings.Contains(err.Error(), "not found") {
@@ -218,7 +279,8 @@ func (c *Client) DeleteEvent(id string, span Span) error {
 // DeleteEvents permanently removes multiple events in a single bridge call.
 // The span parameter applies to all events.
 // Returns a map of event ID to error for any events that failed to delete.
-// Events that don't exist are silently skipped (not included in the error map).
+// IDs must be full and exact. Partial, stale, and unknown IDs are silently
+// skipped (not included in the error map).
 // Returns nil if all deletions succeed (or ids is empty).
 func (c *Client) DeleteEvents(ids []string, span Span) map[string]error {
 	if len(ids) == 0 {
